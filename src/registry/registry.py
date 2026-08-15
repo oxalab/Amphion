@@ -48,6 +48,7 @@ class TaskRegistry:
                     checkpoint_ref TEXT,
                     attempts TEXT NOT NULL,
                     worker_id TEXT,
+                    params TEXT NOT NULL,
                     FOREIGN KEY (task_id) REFERENCES research_tasks(id)
                 )
                 """
@@ -86,8 +87,8 @@ class TaskRegistry:
                     """
                     INSERT INTO steps (
                         id, task_id, kind, status, dependencies, input_artifacts,
-                        output_artifact, checkpoint_ref, attempts, worker_id
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                        output_artifact, checkpoint_ref, attempts, worker_id, params
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         step.id,
@@ -100,6 +101,7 @@ class TaskRegistry:
                         step.checkpoint_ref,
                         json.dumps(step.attempts),
                         step.worker_id,
+                        json.dumps(step.params)
                     ),
                 )
         return task
@@ -268,4 +270,14 @@ class TaskRegistry:
             checkpoint_ref=row["checkpoint_ref"],
             attempts=json.loads(row["attempts"]),
             worker_id=row["worker_id"],
+            params=json.loads(row["params"]),
         )
+
+    def get_step(self, step_id: str) -> Step | None:
+        query = "SELECT * FROM steps WHERE id = ?"
+        row = self.conn.execute(query, (step_id,)).fetchone()
+        if row is None:
+            return None
+
+        return self._row_to_step(row)
+        

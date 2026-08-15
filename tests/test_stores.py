@@ -27,7 +27,6 @@ from src.registry.artifact_store import ArtifactStore
 from src.registry.event_bus import EventBus
 from src.registry.registry import TaskRegistry
 
-
 # --- fixtures / factories ---
 
 def _fresh_stores() -> tuple[sqlite3.Connection, TaskRegistry, EventBus, ArtifactStore]:

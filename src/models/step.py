@@ -44,4 +44,5 @@ class Step(BaseModel):
     checkpoint_ref: str | None = None
     attempts: list[str] = Field(default_factory=list)     # Stub: Fixed when Attempt is defined
     worker_id: str | None = None
+    params: dict = Field(default_factory=dict)
     
