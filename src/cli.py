@@ -25,6 +25,7 @@ from src.registry.artifact_store import ArtifactStore
 from src.registry.event_bus import EventBus
 from src.registry.lesson_store import LessonStore
 from src.registry.registry import TaskRegistry
+from src.workers.benchmark_worker import BenchmarkWorker
 from src.workers.critic_worker import CriticWorker
 from src.workers.paper_worker import PaperWorker
 from src.workers.reflect_worker import ReflectWorker
@@ -112,6 +113,51 @@ def build_paper_task(url: str) -> ResearchTask:
         updated_at=now,
     )
 
+def build_benchmark_task(
+    model_repo: str = "Qwen/Qwen3-0.6B",
+    dtypes: list[str] | None = None
+) -> ResearchTask:
+    """Fan-out DAG: FetchWeights -> [RunBenchmark per dtype] -> Analyze (fan-in)
+    One knob varies across the branches (dtype) -- the minimal valuable comparison.
+    """
+    dtypes = dtypes or ["float16", "float32"]
+    task_id = str(uuid4())
+    fetch_id = str(uuid4())
+    bench_ids = [str(uuid4()) for _ in dtypes]
+    analyze_id = str(uuid4())
+    now = datetime.now(UTC)
+
+    fetch = Step(
+        id=fetch_id, task_id=task_id, kind=StepKind.FETCH_WEIGHTS,
+        dependencies=[], input_artifacts=[], params={"repo_id": model_repo},
+    )
+    bench_steps = [
+        Step(
+            id=bid, task_id=task_id, kind=StepKind.RUN_BENCHMARK,
+            dependencies=[fetch_id], input_artifacts=[],
+            params={"dtype": dt, "n_tokens": 32},
+        )
+        for bid, dt in zip(bench_ids, dtypes)
+    ]
+    analyze = Step(
+        id=analyze_id, task_id=task_id, kind=StepKind.ANALYZE,
+        dependencies=bench_ids,
+        input_artifacts=[],
+    )
+    return ResearchTask(
+        id=task_id,
+        objective=f"Benchmark {model_repo}: {' vs '.join(dtypes)}",
+        status=ResearchTaskStatus.PENDING,
+        priority=Priority.MEDIUM,
+        owner="gpu.benchmark",
+        fingerprint_id=uuid4(),
+        steps=[fetch, *bench_steps, analyze],
+        artifacts=[],
+        retry_count=0,
+        retry_budget=3,
+        created_at=now,
+        updated_at=now,
+    )
 
 def main(url: str) -> None:
     registry, bus, artifacts, lessons, client = wire()
@@ -200,8 +246,50 @@ def main(url: str) -> None:
         print(f"      tags: {', '.join(lesson.tags)}")
 
 
+def main_benchmark() -> None:
+    registry, bus, artifacts, lessons, client = wire()
+    task = build_benchmark_task()
+    registry.create_task(task)
+
+    benchmark_worker = BenchmarkWorker(
+        registry=registry, bus=bus, artifacts=artifacts,
+        kinds=[StepKind.FETCH_WEIGHTS, StepKind.RUN_BENCHMARK, StepKind.ANALYZE],
+        worker_id="bench-1",
+    )
+    workers = [benchmark_worker]
+
+    run_started = datetime.now(UTC)
+    while pending := registry.get_pending_steps():
+        for step in pending:
+            owner = next((w for w in workers if step.kind in w.kinds), None)
+            if owner is not None:
+                owner._execute(step)
+    analyze_id = next(s.id for s in task.steps if s.kind == StepKind.ANALYZE)
+    analyze_step = registry.get_step(analyze_id)
+    print("=" * 60)
+    print("ANALYSIS")
+    print("=" * 60)
+    if analyze_step and analyze_step.output_artifact:
+        raw = artifacts.read(analyze_step.output_artifact)
+        print(raw.decode("utf-8", errors="replace") if raw else "<empty>")
+    else:
+        print("<Analyze did not produce an output>")
+
+    print("\n" + "=" * 60)
+    print("EVENT TIMELINE")
+    for event in bus.replay():
+        if event.created_at >= run_started:
+            print(f"   {event.created_at.isoformat()} {event.type.value}        ({event.producer_id})")
+            
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Summarize + critique a paper end-to-end.")
-    parser.add_argument("url", help="URL of the paper (text/HTML source, not raw PDF)")
+    parser = argparse.ArgumentParser(description="Amphion runner")
+    sub = parser.add_subparsers(dest="command", required=True)
+    p_paper = sub.add_parser("paper", help="summarize + critique + reflect on a URL")
+    p_paper.add_argument("url")
+    p_bench = sub.add_parser("bench", help="run the dtype comparison benchmark")
     args = parser.parse_args()
-    main(args.url)
+    if args.command == "paper":
+        main(args.url)
+    else:
+        main_benchmark()

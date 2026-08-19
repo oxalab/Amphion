@@ -214,6 +214,7 @@ def test_cross_store():
 
     # verify the wiring held together
     got = registry.get_task(task.id)
+    assert got is not None
     step = next(s for s in got.steps if s.id == "s1")
     assert step.status == StepStatus.COMPLETED
     assert step.output_artifact == art.id
@@ -243,7 +244,7 @@ if __name__ == "__main__":
         except AssertionError as e:
             print(f"FAIL  {t.__name__}: {e}")
             traceback.print_exc()
-        except Exception as e:
+        except RuntimeError as e:
             print(f"ERROR {t.__name__}: {type(e).__name__}: {e}")
             traceback.print_exc()
     print(f"\n{passed}/{len(_TESTS)} passed")

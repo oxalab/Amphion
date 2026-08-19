@@ -14,6 +14,7 @@ class ArtifactKind(StrEnum):
     CRITIQUE = "critique"
     REFLECTION = "reflection"
     GRAPH_DELTA = "graph_delta"
+    ANALYSIS = "analysis"
 
 class ArtifactConfidence(StrEnum):
     DEDICATED = "dedicated"

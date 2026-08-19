@@ -48,7 +48,9 @@ def main() -> int:
     # resident in VRAM and corrupt the memory measurements. ---
     try:
         tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-        model = AutoModelForCausalLM.from_pretrained(args.model_path, dtype=dtype).to("cuda")
+        assert tokenizer is not None
+        model = AutoModelForCausalLM.from_pretrained(args.model_path, dtype=dtype)
+        torch.nn.Module.to(model, "cuda")
         model.eval()
     except torch.cuda.OutOfMemoryError as e:
         print(f"OOM during load: {e}", file=sys.stderr)
