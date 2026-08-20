@@ -25,6 +25,7 @@ from src.registry.artifact_store import ArtifactStore
 from src.registry.event_bus import EventBus
 from src.registry.lesson_store import LessonStore
 from src.registry.registry import TaskRegistry
+from src.workers import critic_worker
 from src.workers.benchmark_worker import BenchmarkWorker
 from src.workers.critic_worker import CriticWorker
 from src.workers.paper_worker import PaperWorker
@@ -125,6 +126,7 @@ def build_benchmark_task(
     fetch_id = str(uuid4())
     bench_ids = [str(uuid4()) for _ in dtypes]
     analyze_id = str(uuid4())
+    critique_id = str(uuid4())
     now = datetime.now(UTC)
 
     fetch = Step(
@@ -144,6 +146,11 @@ def build_benchmark_task(
         dependencies=bench_ids,
         input_artifacts=[],
     )
+    critique = Step(
+        id=critique_id, task_id=task_id, kind=StepKind.CRITIQUE,
+        dependencies=[*bench_ids, analyze_id],
+        input_artifacts=[]
+    )
     return ResearchTask(
         id=task_id,
         objective=f"Benchmark {model_repo}: {' vs '.join(dtypes)}",
@@ -151,7 +158,7 @@ def build_benchmark_task(
         priority=Priority.MEDIUM,
         owner="gpu.benchmark",
         fingerprint_id=uuid4(),
-        steps=[fetch, *bench_steps, analyze],
+        steps=[fetch, *bench_steps, analyze, critique],
         artifacts=[],
         retry_count=0,
         retry_budget=3,
@@ -256,7 +263,12 @@ def main_benchmark() -> None:
         kinds=[StepKind.FETCH_WEIGHTS, StepKind.RUN_BENCHMARK, StepKind.ANALYZE],
         worker_id="bench-1",
     )
-    workers = [benchmark_worker]
+    critic_worker = CriticWorker(
+        registry=registry, bus=bus, artifacts=artifacts,
+        kinds=[StepKind.CRITIQUE], worker_id="critic-1",
+        model_client=client, lesson_store=lessons,
+    )
+    workers = [benchmark_worker, critic_worker]
 
     run_started = datetime.now(UTC)
     while pending := registry.get_pending_steps():
@@ -274,6 +286,21 @@ def main_benchmark() -> None:
         print(raw.decode("utf-8", errors="replace") if raw else "<empty>")
     else:
         print("<Analyze did not produce an output>")
+
+    print("\n" + "=" * 60)
+    print("CRITIQUE")
+    print("=" * 60)
+    critique_step = next(
+        (registry.get_step(s.id) for s in task.steps if s.kind == StepKind.CRITIQUE),
+        None
+    )
+    bench_critique_id = next(s.id for s in task.steps if s.kind == StepKind.CRITIQUE)
+    bench_critique = registry.get_step(bench_critique_id)
+    if bench_critique and bench_critique.output_artifact:
+        c = artifacts.read(bench_critique.output_artifact)
+        print(c.decode("utf-8", errors="replace") if c else "<empty>")
+    else:
+        print("<Critique did not produce an output>")
 
     print("\n" + "=" * 60)
     print("EVENT TIMELINE")
