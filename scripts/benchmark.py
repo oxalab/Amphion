@@ -106,6 +106,7 @@ def main() -> int:
         "dtype": args.dtype,
         "batch_size": args.batch_size,
         "n_tokens": args.n_tokens,
+        "gpu": torch.cuda.get_device_name(0),
         "ttft_ms": round(ttft_ms, 2),
         "tokens_per_sec": round(tokens_per_sec, 2),
         "peak_vram_mb": round(peak_vram_mb, 2),

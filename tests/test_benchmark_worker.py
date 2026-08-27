@@ -20,6 +20,7 @@ from src.models.research_task import Priority, ResearchTask, ResearchTaskStatus
 from src.models.step import Step, StepKind, StepStatus
 from src.registry.artifact_store import ArtifactStore
 from src.registry.event_bus import EventBus
+from src.registry.knowledge_store import KnowledgeStore
 from src.registry.registry import TaskRegistry
 from src.workers import benchmark_worker
 from src.workers.benchmark_worker import BenchmarkWorker
@@ -44,6 +45,7 @@ def test_benchmark_fanout_dag():
     registry = TaskRegistry(conn)
     bus = EventBus(conn)
     artifacts = ArtifactStore(conn, base_dir=tempfile.mkdtemp())
+    knowledge = KnowledgeStore(conn)
 
     # stub the network fetch: no download, return a fake cache path
     benchmark_worker.snapshot_download = lambda repo_id: f"/fake/cache/{repo_id}"
@@ -73,7 +75,7 @@ def test_benchmark_fanout_dag():
     worker = _TestableBenchmarkWorker(
         registry=registry, bus=bus, artifacts=artifacts,
         kinds=[StepKind.FETCH_WEIGHTS, StepKind.RUN_BENCHMARK, StepKind.ANALYZE],
-        worker_id="bench-1"
+        worker_id="bench-1", knowledge_store=knowledge
     )
 
     # the driver loop
@@ -116,6 +118,70 @@ def test_benchmark_fanout_dag():
     # bookend events: 4 steps x (started + completed)
     assert len(bus.replay(EventType.STEP_COMPLETED)) == 4
 
+
+def test_benchmark_writes_kg():
+    conn = sqlite3.connect(":memory:")
+    registry = TaskRegistry(conn)
+    bus = EventBus(conn)
+    artifacts = ArtifactStore(conn, base_dir=tempfile.mkdtemp())
+    knowledge=KnowledgeStore(conn)
+
+    benchmark_worker.snapshot_download = lambda repo_id: f"/fake/cache/{repo_id}"
+
+    task_id, fetch_id, analyze_id, update_id, critique_id = (str(uuid4()) for _ in range(5))
+    bench_ids = [str(uuid4()), str(uuid4())]
+    now = datetime.now(UTC)
+
+    def _step(sid, kind, deps, params=None):
+        return Step(id=sid, task_id=task_id, kind=kind, dependencies=deps,
+            input_artifacts=[], params=params or {})
+
+    task = ResearchTask(
+        id=task_id, objective="bench -> kg", status=ResearchTaskStatus.PENDING,
+        priority=Priority.MEDIUM, owner="gpu.benchmark", fingerprint_id=uuid4(),
+        steps=[
+            _step(fetch_id, StepKind.FETCH_WEIGHTS, [], {"repo_id": "Qwen/Qwen3-0.6B"}),
+            _step(bench_ids[0], StepKind.RUN_BENCHMARK, [fetch_id], {"dtype": "float16", "n_tokens": 32}),
+            _step(bench_ids[1], StepKind.RUN_BENCHMARK, [fetch_id], {"dtype": "float32", "n_tokens": 32}),
+            _step(analyze_id, StepKind.ANALYZE, bench_ids),
+            _step(update_id, StepKind.UPDATE_GRAPH, [analyze_id], {"card": "GTX-1650-Ti"}),
+            _step(critique_id, StepKind.CRITIQUE, [*bench_ids, analyze_id, update_id]),
+        ],
+        artifacts=[], retry_count=0, retry_budget=3, created_at=now, updated_at=now,
+    )
+    registry.create_task(task)
+
+    worker = _TestableBenchmarkWorker(
+        registry=registry, bus=bus, artifacts=artifacts,
+        kinds=[StepKind.FETCH_WEIGHTS, StepKind.RUN_BENCHMARK, 
+            StepKind.ANALYZE, StepKind.UPDATE_GRAPH],
+        worker_id="bench-1", knowledge_store=knowledge,
+    )
+    while pending := registry.get_pending_steps():
+        for step in pending:
+            if step.kind in worker.kinds:
+                worker._execute(step)
+
+    done = registry.get_task(task_id)
+    statuses = {s.kind: s.status for s in done.steps} if done else {}
+    assert statuses[StepKind.UPDATE_GRAPH] == StepStatus.COMPLETED
+
+    found = knowledge.find_findings(
+        metric="tokens_per_sec", model="Qwen/Qwen3-0.6B",
+        engine="transformers", card="GTX-1650-Ti",
+    )
+    assert len(found) == 2, f"expected 2 arm-findings, got {len(found)}"
+    assert {f.value for f in found} == {5.64, 2.5}
+    assert {f.value for f in found} == {"dtype=float16", "dtype=float32"}
+
+    for metric in ("ttft_ms", "peak_vram_mb"):
+        assert len(knowledge.find_findings(
+            metric=metric, model="Qwen/Qwen3-0.6B",
+            engine="transformers", card="GTX-1650-Ti"
+        )) == 2
+
+    kinds = [a.kind for a in artifacts.list_by_task(task_id=task_id)]
+    assert ArtifactKind.GRAPH_DELTA in kinds
 
 _TESTS = [test_benchmark_fanout_dag]
 

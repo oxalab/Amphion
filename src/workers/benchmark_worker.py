@@ -8,14 +8,17 @@ from torch import sys
 
 from src.models.artifact import ArtifactConfidence, ArtifactKind
 from src.models.step import Step, StepKind
+from src.registry.knowledge_store import KnowledgeStore
 from src.workers.worker import RunContext, Worker
 
 BENCHMARK_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "benchmark.py"
 SUBPROCESS_TIMEOUT = 600 # ms
+_METRICS = ("ttft_ms", "tokens_per_sec", "peak_vram_mb")
 
 class BenchmarkWorker(Worker):
-    def __init__(self, registry, bus, artifacts, kinds, worker_id):
+    def __init__(self, registry, bus, artifacts, kinds, worker_id, knowledge_store: KnowledgeStore):
         super().__init__(registry, bus, artifacts, kinds, worker_id)
+        self.knowledge_store = knowledge_store
     
     @override
     def handle(self, step: Step, ctx: RunContext) -> str:
@@ -26,6 +29,8 @@ class BenchmarkWorker(Worker):
                 return self._run_benchmark(step, ctx)
             case StepKind.ANALYZE:
                 return self._analyze(step, ctx)
+            case StepKind.UPDATE_GRAPH:
+                return self._update_graph(step, ctx)
             case _:
                 raise ValueError(f"BenchmarkWorker cannot handle step kind {step.kind!r}")
 
@@ -128,4 +133,50 @@ class BenchmarkWorker(Worker):
             produced_by=step.id,
             content_type="application/json",
             )
+        return art.id
+
+    def _update_graph(self, step: Step, ctx: RunContext) -> str:
+        """ANALYSIS -> KG findings. Pure executor: deterministic JSON parse, zero LLM.
+
+        Writes 3 findings per run (one per metric) x 2 runs = 6 per comparison task.
+        NOTE (v0 idempotency): findings are append-only by design; re-running the same
+        task would double-append. Acceptable for v0; flagged in delta.
+        """
+        analysis_art = next(
+            (a for a in ctx.input_artifacts if a.kind == ArtifactKind.ANALYSIS), None
+        )
+        if analysis_art is None:
+            raise ValueError("UpdateGraph received no ANALYSIS input artifact.")
+        raw = ctx.artifacts.read(analysis_art.id)
+        if raw is None:
+            raise ValueError(f"ANALYSIS artifact {analysis_art.id} not readable")
+        analysis = json.loads(raw)
+
+        card_fallback = step.params.get("card", "GTX-1650-Ti")
+        added = 0
+        for run in (analysis["run_a"], analysis["run_b"]):
+            card = run.get("gpu", card_fallback)
+            for metric in _METRICS:
+                self.knowledge_store.add_finding(
+                    metric=metric,
+                    model=run["model"],
+                    engine=run["engine"],
+                    config=f"dtype={run['dtype']}",
+                    card=card,
+                    task_id=step.task_id,
+                    value=run[metric],
+                )
+                added += 1
+        delta = {
+            "findings_added": added,
+            "card": card_fallback,
+            "note": "append-only; re-running the same task double-appends (v0 known)"
+        }
+        art = ctx.artifacts.put(
+            json.dumps(delta, indent=2).encode("utf-8"),
+            kind=ArtifactKind.GRAPH_DELTA,
+            task_id=step.task_id,
+            produced_by=step.id,
+            content_type="application/json"
+        )
         return art.id
