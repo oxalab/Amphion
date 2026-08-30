@@ -23,6 +23,7 @@ from src.models.research_task import Priority, ResearchTask, ResearchTaskStatus
 from src.models.step import Step, StepKind
 from src.registry.artifact_store import ArtifactStore
 from src.registry.event_bus import EventBus
+from src.registry.knowledge_store import KnowledgeStore
 from src.registry.lesson_store import LessonStore
 from src.registry.registry import TaskRegistry
 from src.workers import critic_worker
@@ -49,7 +50,7 @@ def load_config() -> tuple[str, str]:
     return api_key, base_url
 
 
-def wire() -> tuple[TaskRegistry, EventBus, ArtifactStore, LessonStore, OpenAI]:
+def wire() -> tuple[TaskRegistry, EventBus, ArtifactStore, LessonStore, KnowledgeStore, OpenAI]:
     """Composition root: build the real stores + LLM client. The ONE place that constructs."""
     api_key, base_url = load_config()
 
@@ -58,9 +59,10 @@ def wire() -> tuple[TaskRegistry, EventBus, ArtifactStore, LessonStore, OpenAI]:
     bus = EventBus(conn)
     artifacts = ArtifactStore(conn, base_dir=ARTIFACT_DIR)
     lessons = LessonStore(conn)
+    knowledge = KnowledgeStore(conn)
 
     model_client = OpenAI(base_url=base_url, api_key=api_key)
-    return registry, bus, artifacts, lessons, model_client
+    return registry, bus, artifacts, lessons, knowledge, model_client
 
 
 def build_paper_task(url: str) -> ResearchTask:
@@ -116,17 +118,30 @@ def build_paper_task(url: str) -> ResearchTask:
 
 def build_benchmark_task(
     model_repo: str = "Qwen/Qwen3-0.6B",
-    dtypes: list[str] | None = None
+    dtypes: list[str] | None = None,
+    n_replicates: int = 3
 ) -> ResearchTask:
-    """Fan-out DAG: FetchWeights -> [RunBenchmark per dtype] -> Analyze (fan-in)
-    One knob varies across the branches (dtype) -- the minimal valuable comparison.
+    """Fan-out DAG: FetchWeights -> [RunBenchmark per (dtype, replicate)] -> Analyze (fan-in)
+    One knob varies across the branches (dtype); N replicates per arm so the judge can reason
+    about run-to-tun variance (its own flagged fix: N=1 per config)
     """
+    if n_replicates < 1:
+        raise ValueError("n_replicates must be >= 1")
     dtypes = dtypes or ["float16", "float32"]
     task_id = str(uuid4())
     fetch_id = str(uuid4())
-    bench_ids = [str(uuid4()) for _ in dtypes]
+    bench_ids = [str(uuid4()) for _ in range(len(dtypes) * n_replicates)]
     analyze_id = str(uuid4())
+    update_id = str(uuid4())
     critique_id = str(uuid4())
+    
+    update_graph = Step(
+        id=update_id, task_id=task_id, kind=StepKind.UPDATE_GRAPH,
+        # deps = the RESULT-producing steps: UpdateGraph reads raw runs (the KG
+        # records observations, never aggregates), so it no longer waits on Analyze.
+        dependencies=[*bench_ids], input_artifacts=[],
+        params={"card":"GTX-1650-Ti"}
+    )
     now = datetime.now(UTC)
 
     fetch = Step(
@@ -137,9 +152,14 @@ def build_benchmark_task(
         Step(
             id=bid, task_id=task_id, kind=StepKind.RUN_BENCHMARK,
             dependencies=[fetch_id], input_artifacts=[],
-            params={"dtype": dt, "n_tokens": 32},
+            # dtype-major, replicate-minor (float16 x3, then float32 x3). Replicate
+            # index deliberately NOT in params -- params are identical within an arm
+            # so the config stamp groups them in the KG.
+            params={"knob": "dtype", "dtype": dt, "n_tokens": 128, "batch_size": 1},
         )
-        for bid, dt in zip(bench_ids, dtypes)
+        for bid, dt in zip(
+            bench_ids, [dt for dt in dtypes for _ in range(n_replicates)]
+        )
     ]
     analyze = Step(
         id=analyze_id, task_id=task_id, kind=StepKind.ANALYZE,
@@ -148,7 +168,7 @@ def build_benchmark_task(
     )
     critique = Step(
         id=critique_id, task_id=task_id, kind=StepKind.CRITIQUE,
-        dependencies=[*bench_ids, analyze_id],
+        dependencies=[*bench_ids, analyze_id, update_id],
         input_artifacts=[]
     )
     return ResearchTask(
@@ -158,7 +178,7 @@ def build_benchmark_task(
         priority=Priority.MEDIUM,
         owner="gpu.benchmark",
         fingerprint_id=uuid4(),
-        steps=[fetch, *bench_steps, analyze, critique],
+        steps=[fetch, *bench_steps, analyze, update_graph, critique],
         artifacts=[],
         retry_count=0,
         retry_budget=3,
@@ -167,7 +187,7 @@ def build_benchmark_task(
     )
 
 def main(url: str) -> None:
-    registry, bus, artifacts, lessons, client = wire()
+    registry, bus, artifacts, lessons, knowledge, client = wire()
     task = build_paper_task(url)
     registry.create_task(task)
 
@@ -179,7 +199,7 @@ def main(url: str) -> None:
     critic_worker = CriticWorker(
         registry=registry, bus=bus, artifacts=artifacts,
         kinds=[StepKind.CRITIQUE], worker_id="critic-1",
-        model_client=client, lesson_store=lessons,
+        model_client=client, lesson_store=lessons, knowledge_store=knowledge
     )
     reflect_worker = ReflectWorker(
         registry=registry, bus=bus, artifacts=artifacts,
@@ -254,19 +274,20 @@ def main(url: str) -> None:
 
 
 def main_benchmark() -> None:
-    registry, bus, artifacts, lessons, client = wire()
+    registry, bus, artifacts, lessons, knowledge, client = wire()
     task = build_benchmark_task()
     registry.create_task(task)
 
     benchmark_worker = BenchmarkWorker(
         registry=registry, bus=bus, artifacts=artifacts,
-        kinds=[StepKind.FETCH_WEIGHTS, StepKind.RUN_BENCHMARK, StepKind.ANALYZE],
-        worker_id="bench-1",
+        kinds=[StepKind.FETCH_WEIGHTS, StepKind.RUN_BENCHMARK,
+            StepKind.ANALYZE, StepKind.UPDATE_GRAPH],
+        worker_id="bench-1", knowledge_store=knowledge
     )
     critic_worker = CriticWorker(
         registry=registry, bus=bus, artifacts=artifacts,
         kinds=[StepKind.CRITIQUE], worker_id="critic-1",
-        model_client=client, lesson_store=lessons,
+        model_client=client, lesson_store=lessons, knowledge_store=knowledge
     )
     workers = [benchmark_worker, critic_worker]
 
@@ -290,10 +311,6 @@ def main_benchmark() -> None:
     print("\n" + "=" * 60)
     print("CRITIQUE")
     print("=" * 60)
-    critique_step = next(
-        (registry.get_step(s.id) for s in task.steps if s.kind == StepKind.CRITIQUE),
-        None
-    )
     bench_critique_id = next(s.id for s in task.steps if s.kind == StepKind.CRITIQUE)
     bench_critique = registry.get_step(bench_critique_id)
     if bench_critique and bench_critique.output_artifact:

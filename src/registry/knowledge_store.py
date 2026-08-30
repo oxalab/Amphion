@@ -3,8 +3,9 @@
 Model: typed nodes + types edges, stored in two tables. Context nodes
 (MODEL/ENGINE/CARD/METRIC/CONFIG/TASK) are IDENTITIES — get-or-created
 by (type, key), shared across all tasks. FINDING nodes are OBSERVATIONS
-— append only, one per measurement, never deduped (Shapre I: aggregated-on-read,
-so the judge sees the raw evidence and does the aggregating).
+— append-only, one per measurement, deduped by SOURCE RUN (provenance),
+never by value (Shape I: aggregated-on-read, so the judge sees the raw
+evidence and does the aggregating).
 
 The retrieval query (find_findings) is the 1-hop traversal in SQL: FINDINGs
 whose context edges point at the four given nodes. Deliberately NOT filtered 
@@ -16,7 +17,7 @@ import sqlite3
 from dataclasses import dataclass
 
 _FINDING = "FINDING"
-_VALID_TYPES = {"MODEL", "ENGINE", "CARD", "METRIC", "CONFIG", "TASK", _FINDING}
+_VALID_TYPES = {"MODEL", "ENGINE", "CARD", "METRIC", "CONFIG", "PROTOCOL", "TASK", _FINDING}
 
 @dataclass
 class Finding:
@@ -82,19 +83,34 @@ class KnowledgeStore:
 
     # --- Writing Findings---
     def add_finding(self, *, metric: str, model: str, engine: str, card: str, config: str,
-        task_id: str, value: float) -> int:
-        """Append one measurement observation. Takes DOMAIN args, not node ids ---
-        callers never touch graph intenals. Context nodes are get-or-created (identities);
-        the FINDING node is a fresh INSERT (append-only)."""
+        task_id: str, value: float, source: str, protocol: str) -> bool:
+        """Append one measurement observation, identified by its SOURCE run (the
+        RESULT artifact id). Takes DOMAIN args, not node ids --- callers never
+        touch graph internals. Context nodes are get-or-created (identities).
+
+        Returns True if a new finding was appended; False if this exact (source,
+        value) was already recorded --- re-ingesting a run is an idempotent no-op.
+        Identical VALUES from different runs are distinct observations: deterministic
+        metrics (peak_vram repeats to 0.01 MB) must append, not collide.
+        protocol: canonical JSON of the frozen setup (what did NOT vary).
+        """
         metric_id = self.get_or_create_node("METRIC", metric)
         model_id = self.get_or_create_node("MODEL", model)
         engine_id = self.get_or_create_node("ENGINE", engine)
         card_id = self.get_or_create_node("CARD", card)
         config_id = self.get_or_create_node("CONFIG", config)
+        protocol_id = self.get_or_create_node("PROTOCOL", protocol)
         task_node_id = self.get_or_create_node("TASK", f"task-{task_id}")
 
-        # FINDING key carries the payload: value + provenance (Phase 0 discipline)
-        finding_key = json.dumps({"value": value, "task": task_id})
+        # FINDING key carries the payload + provenance (Phase 0 discipline).
+        # Identity is the RUN it came from, NOT the value -- identity-by-value
+        # made deterministic metrics crash on replicate 2.
+        finding_key = json.dumps({"value": value, "task": task_id, "source": source})
+        existing = self.conn.execute(
+            "SELECT id FROM kg_nodes WHERE type = ? AND key = ?", (_FINDING, finding_key)
+        ).fetchone()
+        if existing is not None:
+            return False
         with self.conn:
             cur = self.conn.execute(
                 "INSERT INTO kg_nodes (type, key) VALUES (?, ?)", (_FINDING, finding_key)
@@ -108,19 +124,23 @@ class KnowledgeStore:
         self._add_edge(finding_id, "ON_CARD", card_id)
         self._add_edge(finding_id, "WITH_CONFIG", config_id)
         self._add_edge(finding_id, "FROM_TASK", task_node_id)
-        return finding_id
+        self._add_edge(finding_id, "WITH_PROTOCOL", protocol_id)
+        return True
 
     # --- reading (the 1-hop traversal, in SQL) ---
-    def find_findings(self, *, metric: str, model: str, engine: str, card: str) -> list[Finding]:
+    def find_findings(self, *, metric: str, model: str, engine: str, card: str, protocol: str | None = None) -> list[Finding]:
         """All FINDING observations in this four-part context — every dtype/config, every task.
         Returns raw evidence; aggregation is the reader's judgement."""
         metric_id = self._find_node("METRIC", metric)
         model_id = self._find_node("MODEL", model)
         engine_id = self._find_node("ENGINE", engine)
         card_id = self._find_node("CARD", card)
+        protocol_id = self._find_node("PROTOCOL", protocol) if protocol else None
         if None in (metric_id, model_id, engine_id, card_id):
             return []
-
+        if protocol is not None and protocol_id is None:
+            return []
+        
         rows = self.conn.execute(
             """
             SELECT f.key AS finding_key, c.key AS config_key
@@ -129,12 +149,14 @@ class KnowledgeStore:
             JOIN kg_edges e2 ON e2.src_id = f.id AND e2.rel = 'ON_MODEL'  AND e2.dst_id = :model_id
             JOIN kg_edges e3 ON e3.src_id = f.id AND e3.rel = 'ON_ENGINE' AND e3.dst_id = :engine_id
             JOIN kg_edges e4 ON e4.src_id = f.id AND e4.rel = 'ON_CARD'   AND e4.dst_id = :card_id
+            JOIN kg_edges ep ON ep.src_id = f.id AND ep.rel = 'WITH_PROTOCOL'
+            JOIN kg_nodes pn ON pn.id = ep.dst_id
             JOIN kg_edges ec ON ec.src_id = f.id AND ec.rel = 'WITH_CONFIG'
             JOIN kg_nodes c  ON c.id = ec.dst_id
-            WHERE f.type = 'FINDING'
+            WHERE f.type = 'FINDING' AND (:protocol IS NULL OR pn.key = :protocol)
             """,
             {"metric_id": metric_id, "model_id": model_id,
-                "engine_id": engine_id, "card_id": card_id},
+                "engine_id": engine_id, "card_id": card_id, "protocol": protocol},
         ).fetchall()
 
         findings: list[Finding] = []

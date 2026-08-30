@@ -1,8 +1,9 @@
 """ Fake-first BenchmarkWorker test: no GPU, no subprocess, no network.
 
-Overrides _run_subprocess with canned JSON (your real fp16 run + a plausible fp32)
-and stubs snapshot_download. Proves the fan-out DAG end to end:
-    FetchWeights -> RunBenchmark  x2 -> Analyze comparing both.
+Overrides _run_subprocess with canned JSON (3 distinct replicates per dtype,
+built around the real fp16 runs) and stubs snapshot_download. Proves the
+replicated fan-out DAG end to end:
+    FetchWeights -> RunBenchmark x6 (2 arms x 3 replicates) -> Analyze -> UpdateGraph.
 
 """
 
@@ -27,18 +28,38 @@ from src.workers.benchmark_worker import BenchmarkWorker
 
 # canned by dtype -- fp16 line us your real measured run
 CANNED = {
-        "float16": json.dumps({"model": "Qwen/Qwen3-0.6B", "dtype": "float16", "batch_size": 1,
-                             "n_tokens": 32, "ttft_ms": 119.9, "tokens_per_sec": 5.64,
-                             "peak_vram_mb": 1187.83, "total_time_ms": 5736.04}),
-        "float32": json.dumps({"model": "Qwen/Qwen3-0.6B", "dtype": "float32", "batch_size": 1,
-                             "n_tokens": 32, "ttft_ms": 152.3, "tokens_per_sec": 2.5,
-                             "peak_vram_mb": 2401.5, "total_time_ms": 12752.1}),
+    "float16": [
+            {"model": "Qwen/Qwen3-0.6B", "dtype": "float16", "batch_size": 1,
+            "n_tokens": 128, "ttft_ms": 119.9, "tokens_per_sec": 5.64,
+            "peak_vram_mb": 1187.83, "total_time_ms": 5736.04},
+            {"model": "Qwen/Qwen3-0.6B", "dtype": "float16", "batch_size": 1,
+            "n_tokens": 128, "ttft_ms": 124.1, "tokens_per_sec": 5.55,
+            "peak_vram_mb": 1187.83, "total_time_ms": 5812.20},
+            {"model": "Qwen/Qwen3-0.6B", "dtype": "float16", "batch_size": 1,
+            "n_tokens": 128, "ttft_ms": 117.8, "tokens_per_sec": 5.68,
+            "peak_vram_mb": 1187.83, "total_time_ms": 5701.90},
+        ],
+        "float32": [
+            {"model": "Qwen/Qwen3-0.6B", "dtype": "float32", "batch_size": 1,
+            "n_tokens": 128, "ttft_ms": 152.3, "tokens_per_sec": 2.50,
+            "peak_vram_mb": 2401.50, "total_time_ms": 12752.10},
+            {"model": "Qwen/Qwen3-0.6B", "dtype": "float32", "batch_size": 1,
+            "n_tokens": 128, "ttft_ms": 160.0, "tokens_per_sec": 2.62,
+            "peak_vram_mb": 2401.50, "total_time_ms": 12150.30},
+            {"model": "Qwen/Qwen3-0.6B", "dtype": "float32", "batch_size": 1,
+            "n_tokens": 128, "ttft_ms": 149.5, "tokens_per_sec": 2.41,
+            "peak_vram_mb": 2401.50, "total_time_ms": 13110.70},
+        ],
 }
 
 class _TestableBenchmarkWorker(BenchmarkWorker):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._canned = {dt: list(runs) for dt, runs in CANNED.items()}
+    
     def _run_subprocess(self, cmd):
         dtype = cmd[cmd.index("--dtype") + 1]
-        return CANNED[dtype]
+        return json.dumps(self._canned[dtype].pop(0))
 
 def test_benchmark_fanout_dag():
     conn = sqlite3.connect(":memory:")
@@ -52,7 +73,7 @@ def test_benchmark_fanout_dag():
 
     # build the fan-out task inline (same shape as cli.build_benchmark_task)
     task_id, fetch_id = str(uuid4()), str(uuid4())
-    bench_a, bench_b = str(uuid4()), str(uuid4())
+    bench_ids = [str(uuid4()) for _ in range(6)]  # 2 arms x 3 replicates
     now = datetime.now(UTC)
 
     def _step(sid, kind, deps, params=None):
@@ -64,9 +85,10 @@ def test_benchmark_fanout_dag():
         priority=Priority.MEDIUM, owner="gpu.benchmark", fingerprint_id=uuid4(),
         steps=[
             _step(fetch_id, StepKind.FETCH_WEIGHTS, [], {"repo_id": "Qwen/Qwen3-0.6B"}),
-            _step(bench_a, StepKind.RUN_BENCHMARK, [fetch_id], {"dtype": "float16", "n_tokens": 32}),
-            _step(bench_b, StepKind.RUN_BENCHMARK, [fetch_id], {"dtype": "float32", "n_tokens": 32}),
-            _step("analyze", StepKind.ANALYZE, [bench_a, bench_b]),
+            *(_step(bid, StepKind.RUN_BENCHMARK, [fetch_id],
+                    {"knob": "dtype", "dtype": dt, "n_tokens": 128})
+              for bid, dt in zip(bench_ids, ["float16"] * 3 + ["float32"] * 3)),
+            _step("analyze", StepKind.ANALYZE, bench_ids),
         ],
         artifacts=[], retry_count=0, retry_budget=3, created_at=now, updated_at=now,
     )
@@ -91,10 +113,11 @@ def test_benchmark_fanout_dag():
             [ (s.kind, s.status) for s in done.steps]
 
 
-    # artifacts: 1 WEIGHTS + 2 RESULT + 1 ANALYSIS
+    # artifacts: 1 WEIGHTS + 6 RESULT + 1 ANALYSIS
     task_arts = artifacts.list_by_task(task_id)
     kinds = sorted(a.kind for a in task_arts)
-    assert kinds == [ArtifactKind.ANALYSIS, ArtifactKind.RESULT, ArtifactKind.RESULT, ArtifactKind.WEIGHTS], kinds
+    expected = [ArtifactKind.ANALYSIS, ArtifactKind.WEIGHTS] + [ArtifactKind.RESULT] * 6
+    assert kinds == sorted(expected), kinds
 
     # the analysis computed the real deltas from the canned runs
     analysis_art = next(a for a in task_arts if a.kind == ArtifactKind.ANALYSIS)
@@ -102,8 +125,15 @@ def test_benchmark_fanout_dag():
     if raw_analysis is None:
         raise ValueError(f"Analysis artifact not found: {analysis_art.id}")
     analysis = json.loads(raw_analysis)
-    assert analysis["tokens_per_sec_ratio"] == round(5.64 / 2.5, 3)
-    assert analysis["ttft_diff_ms"] == round(119.9 - 152.3, 2)
+    # arms shape: grouped by stamped config, raw values + mean per metric
+    assert [arm["config"] for arm in analysis["arms"]] == ["dtype=float16", "dtype=float32"]
+    assert all(arm["n"] == 3 for arm in analysis["arms"])
+    assert analysis["arms"][0]["metrics"]["tokens_per_sec"]["values"] == [5.64, 5.55, 5.68]
+    assert analysis["arms"][0]["metrics"]["tokens_per_sec"]["mean"] == 5.623
+    # deltas are ratio/diff of (rounded) means
+    assert analysis["tokens_per_sec_ratio"] == round(5.623 / 2.51, 3)
+    assert analysis["ttft_diff_ms"] == round((119.9 + 124.1 + 117.8) / 3
+                                             - (152.3 + 160.0 + 149.5) / 3, 2)
     assert analysis["peak_vram_diff_mb"] == round(1187.83 - 2401.5, 2)
 
     # engine tag stamped on results
@@ -115,8 +145,22 @@ def test_benchmark_fanout_dag():
             )
             assert json.loads(read_art)["engine"] == "transformers"
 
-    # bookend events: 4 steps x (started + completed)
-    assert len(bus.replay(EventType.STEP_COMPLETED)) == 4
+    # config stamp: params -> arm identity, on every RESULT
+    stamped = {
+        json.loads(data)["config"]
+        for a in task_arts
+        if a.kind == ArtifactKind.RESULT and (data := artifacts.read(a.id)) is not None
+    }
+    assert stamped == {"dtype=float16", "dtype=float32"}, stamped
+    protocols = {
+        json.loads(data)["protocol"]
+        for a in task_arts
+        if a.kind == ArtifactKind.RESULT and (data := artifacts.read(a.id)) is not None
+    }
+    assert protocols == {'{"batch_size": 1, "n_tokens": 128}'}, protocols
+        
+    # bookend events: 8 steps x (started + completed)
+    assert len(bus.replay(EventType.STEP_COMPLETED)) == 8
 
 
 def test_benchmark_writes_kg():
@@ -128,8 +172,8 @@ def test_benchmark_writes_kg():
 
     benchmark_worker.snapshot_download = lambda repo_id: f"/fake/cache/{repo_id}"
 
-    task_id, fetch_id, analyze_id, update_id, critique_id = (str(uuid4()) for _ in range(5))
-    bench_ids = [str(uuid4()), str(uuid4())]
+    task_id, fetch_id, analyze_id, update_id = (str(uuid4()) for _ in range(4))
+    bench_ids = [str(uuid4()) for _ in range(6)]  # 2 arms x 3 replicates
     now = datetime.now(UTC)
 
     def _step(sid, kind, deps, params=None):
@@ -141,11 +185,11 @@ def test_benchmark_writes_kg():
         priority=Priority.MEDIUM, owner="gpu.benchmark", fingerprint_id=uuid4(),
         steps=[
             _step(fetch_id, StepKind.FETCH_WEIGHTS, [], {"repo_id": "Qwen/Qwen3-0.6B"}),
-            _step(bench_ids[0], StepKind.RUN_BENCHMARK, [fetch_id], {"dtype": "float16", "n_tokens": 32}),
-            _step(bench_ids[1], StepKind.RUN_BENCHMARK, [fetch_id], {"dtype": "float32", "n_tokens": 32}),
+            *(_step(bid, StepKind.RUN_BENCHMARK, [fetch_id],
+                    {"dtype": dt, "n_tokens": 128})
+              for bid, dt in zip(bench_ids, ["float16"] * 3 + ["float32"] * 3)),
             _step(analyze_id, StepKind.ANALYZE, bench_ids),
-            _step(update_id, StepKind.UPDATE_GRAPH, [analyze_id], {"card": "GTX-1650-Ti"}),
-            _step(critique_id, StepKind.CRITIQUE, [*bench_ids, analyze_id, update_id]),
+            _step(update_id, StepKind.UPDATE_GRAPH, bench_ids, {"card": "GTX-1650-Ti"}),
         ],
         artifacts=[], retry_count=0, retry_budget=3, created_at=now, updated_at=now,
     )
@@ -157,10 +201,16 @@ def test_benchmark_writes_kg():
             StepKind.ANALYZE, StepKind.UPDATE_GRAPH],
         worker_id="bench-1", knowledge_store=knowledge,
     )
+    workers = [worker]
     while pending := registry.get_pending_steps():
+        progressed = False
         for step in pending:
-            if step.kind in worker.kinds:
-                worker._execute(step)
+            owner = next((w for w in workers if step.kind in w.kinds), None)
+            if owner is not None:
+                owner._execute(step)
+                progressed = True
+        if not progressed:
+            raise RuntimeError(f"no worker claims: {sorted({s.kind.value for s in pending})}")
 
     done = registry.get_task(task_id)
     statuses = {s.kind: s.status for s in done.steps} if done else {}
@@ -170,20 +220,33 @@ def test_benchmark_writes_kg():
         metric="tokens_per_sec", model="Qwen/Qwen3-0.6B",
         engine="transformers", card="GTX-1650-Ti",
     )
-    assert len(found) == 2, f"expected 2 arm-findings, got {len(found)}"
-    assert {f.value for f in found} == {5.64, 2.5}
-    assert {f.value for f in found} == {"dtype=float16", "dtype=float32"}
+    assert len(found) == 6, f"expected 6 per-sample findings, got {len(found)}"
+    per_config: dict[str, set] = {}
+    for f in found:
+        per_config.setdefault(f.config, set()).add(f.value)
+    assert per_config["dtype=float16"] == {5.64, 5.55, 5.68}
+    assert per_config["dtype=float32"] == {2.50, 2.62, 2.41}
 
     for metric in ("ttft_ms", "peak_vram_mb"):
         assert len(knowledge.find_findings(
             metric=metric, model="Qwen/Qwen3-0.6B",
             engine="transformers", card="GTX-1650-Ti"
-        )) == 2
+        )) == 6
 
     kinds = [a.kind for a in artifacts.list_by_task(task_id=task_id)]
     assert ArtifactKind.GRAPH_DELTA in kinds
+    # the delta counts what actually landed: 3 metrics x 3 replicates x 2 arms
+    delta_art = next(a for a in artifacts.list_by_task(task_id)
+                     if a.kind == ArtifactKind.GRAPH_DELTA)
+    data = artifacts.read(delta_art.id) 
+    assert data is not None, f"Artifact {delta_art.id} returned None"
+    delta = json.loads(data)
+    assert delta["findings_added"] == 18, delta
 
-_TESTS = [test_benchmark_fanout_dag]
+_TESTS = [
+    test_benchmark_fanout_dag,
+    test_benchmark_writes_kg
+]
 
 if __name__ == "__main__":
     passed = 0

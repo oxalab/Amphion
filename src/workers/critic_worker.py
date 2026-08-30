@@ -9,8 +9,11 @@ rating tokens per section. No JSON -- LLMs produce headers reliably, and Reflect
 says "looks good" is a FAILED review.
 """
 
+import json
+
 from src.models.artifact import ArtifactKind
 from src.models.step import Step, StepKind
+from src.registry.knowledge_store import KnowledgeStore
 from src.registry.lesson_store import LessonStore
 from src.workers.worker import RunContext, Worker
 
@@ -23,10 +26,13 @@ _COVERAGE_FIELDS = {"method", "dataset", "metrics", "novelty", "limitations"}
 class CriticWorker(Worker):
     DEFAULT_MODEL = "glm-4.5-air"
 
-    def __init__(self, registry, bus, artifacts, kinds, worker_id, model_client, lesson_store: LessonStore):
+    def __init__(self, registry, bus, artifacts, kinds, worker_id, 
+                model_client, lesson_store: LessonStore,
+                knowledge_store: KnowledgeStore | None = None):
         super().__init__(registry, bus, artifacts, kinds, worker_id)
         self.model_client = model_client
         self.lesson_store = lesson_store
+        self.knowledge_store = knowledge_store
 
     def handle(self, step: Step, ctx: RunContext) -> str:
         match step.kind:
@@ -112,8 +118,37 @@ class CriticWorker(Worker):
 
         model = step.params.get("model", self.DEFAULT_MODEL)
         lessons = self.lesson_store.get_active(["step_kind:Critique", f"model:{model}"])
+
+        evidence_block = ""
+        if self.knowledge_store is not None:
+            first_run = json.loads(runs_json[0])
+            prior = self.knowledge_store.find_findings(
+                metric="tokens_per_sec",
+                model=first_run["model"],
+                engine=first_run["engine"],
+                card=first_run.get("gpu", step.params.get("card", "GTX-1650-Ti")),
+                protocol=first_run.get("protocol")
+            )
+            if prior:
+                arms: dict[str, list[float]] = {}
+                for f in prior:
+                    arms.setdefault(f.config, []).append(f.value)
+                lines = "\n".join(
+                    f"  {config}: {', '.join(str(v) for v in sorted(values))} (n={len(values)})"
+                    for config, values in sorted(arms.items())
+                )
+                evidence_block = (
+                    "## PRIOR OBSERVATIONS (knowledge graph, same protocol: "
+                    f"{first_run.get('protocol')}):\n"
+                    f"tokens_per_sec on this card, by config:\n{lines}\n\n"
+                    "Weigh this accumulated evidence alongside the current runs. "
+                    "Direction consistent across many observations is stable even if "
+                    "any single pair wobbles; magnitude drift bounds the ratio's precision.\n\n"
+                )
         prompt = self._benchmark_prompt(
-            analysis_bytes.decode("utf-8", errors="replace"), runs_json, lessons
+            analysis_bytes.decode("utf-8", errors="replace"), 
+            runs_json, lessons,
+            evidence=evidence_block,
         )
         response = self.model_client.chat.completions.create(
             model=model, messages=[{"role": "user", "content": prompt}]
@@ -130,7 +165,7 @@ class CriticWorker(Worker):
         return art.id
 
 
-    def _benchmark_prompt(self, analysis_text: str, runs_json: list[str], lessons) -> str:
+    def _benchmark_prompt(self, analysis_text: str, runs_json: list[str], lessons, evidence: str = "") -> str:
         lessons_block = ""
         if lessons:
             bullets = "\n".join(f"- {lesson.text}" for lesson in lessons)
@@ -143,21 +178,24 @@ class CriticWorker(Worker):
             "review. Hunt for the failure modes: noise mistaken for signal, invalid runs, "
             "unstable effect sizes.\n\n"
             f"{lessons_block}"
+            f"{evidence}"
             "## ANALYSIS (the claims being judged)\n"
             f"{analysis_text}\n\n"
             f"{runs_blocks}\n\n"
-            "Judge the benchmark. Output EXACTLY the markdown below -- no preamble:\n\n"
+            "Judge the benchmark. Your output MUST contain ONLY the three sections below -- "
+            "do NOT quote, restate, or echo any instruction text, checklist, or template "
+            "language. Begin directly with '## Validity:'.\n\n"
             "## Validity: <HIGH | MEDIUM | LOW>\n"
             "Were both measurements trustworthy? Checklist, name any violation concretely: "
             "sane values (no 0 tok/s, no negative latency); and the runs differ ONLY in the "
             "declared knob -- same model, engine, n_tokens, batch_size (verify against the "
             "raw runs, not the analysis's claim). If fully valid, say so in one line.\n\n"
             "## Stability: <STABLE | MARGINAL | UNSTABLE>\n"
-            "Is the delta real -- outside the noise floor? The raw runs are a sample of "
-            "size 2 per config: reason about run-to-run variance from what you can see "
-            "(e.g. a 25% effect on a metric that swings 25% between runs is MARGINAL at "
-            "best). Would more runs change the conclusion? Which specific number is the "
-            "shakiest?\n\n"
+            "Is the delta real -- outside the noise floor? Each arm in the analysis"
+            "reports its n raw values; reason about run-to-run variance from the "
+            "spread you can see (e.g. a 25% effect on a metric that swings 25% "
+            "between runs is MARGINAL at best). Would more runs change the "
+            "conclusion? Which specific number is the shakiest?\n\n"
             "## Overall: <HIGH | MEDIUM | LOW>\n"
             "One line, DERIVED from the above -- not a new judgment.\n"
         )
