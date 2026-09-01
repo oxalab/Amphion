@@ -14,7 +14,7 @@ from src.workers.worker import RunContext, Worker
 BENCHMARK_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "benchmark.py"
 SUBPROCESS_TIMEOUT = 600  # seconds
 _METRICS = ("ttft_ms", "tokens_per_sec", "peak_vram_mb")
-_PROTOCOL_DEFAULTS = {"n_tokens": 64, "batch_size": 1}
+_PROTOCOL_DEFAULTS = {"n_tokens": 64, "batch_size": 1, "dtype": "float16"}
 
 class BenchmarkWorker(Worker):
     def __init__(self, registry, bus, artifacts, kinds, worker_id, knowledge_store: KnowledgeStore):
@@ -68,13 +68,14 @@ class BenchmarkWorker(Worker):
         dtype = step.params.get("dtype", "float16")
         n_tokens = str(step.params.get("n_tokens", 64))
         batch_size = str(step.params.get("batch_size", 1))
-
+        use_cache = str(bool(step.params.get("use_cache", False))).lower()
         cmd = [
             sys.executable, str(BENCHMARK_SCRIPT),
             "--model_path", repo_id,
             "--dtype", dtype,
             "--n_tokens", n_tokens,
             "--batch_size", batch_size,
+            "--use_cache", use_cache
         ]
         stdout = self._run_subprocess(cmd)
 

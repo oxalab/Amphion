@@ -65,6 +65,49 @@ def wire() -> tuple[TaskRegistry, EventBus, ArtifactStore, LessonStore, Knowledg
     return registry, bus, artifacts, lessons, knowledge, model_client
 
 
+def _comparison_task(model_repo:str, arm_params: list[dict], objective:str, n_replicates: int = 3) -> ResearchTask:
+    """Shared 2-arm skeleton: FetchWeights -> RunBenchmark x (arms x replicates)
+    -> Analyze / UpdateGraph / Critique. Arm params replicate identically — no 
+    replicate index, so the config stamp groups them in the KG."""
+    if n_replicates < 1:
+        raise ValueError("n_replicates must be >= 1")
+    task_id = str(uuid4())
+    fetch_id = str(uuid4())
+    expanded = [dict(p) for p in arm_params for _ in range(n_replicates)]
+    bench_ids = [str(uuid4()) for _ in expanded]
+    analyze_id, update_id, critique_id = str(uuid4()), str(uuid4()), str(uuid4())
+
+    update_graph = Step(
+        id=update_id, task_id=task_id, kind=StepKind.UPDATE_GRAPH,
+        dependencies=[*bench_ids], input_artifacts=[],
+        params={"card": "GTX-1650-Ti"},
+    )
+    now = datetime.now(UTC)
+    fetch = Step(
+        id=fetch_id, task_id=task_id, kind=StepKind.FETCH_WEIGHTS,
+        dependencies=[], input_artifacts=[], params={"repo_id": model_repo},
+    )
+    bench_steps = [
+        Step(id=bid, task_id=task_id, kind=StepKind.RUN_BENCHMARK,
+            dependencies=[fetch_id], input_artifacts=[], params=params)
+        for bid, params in zip(bench_ids, expanded)
+    ]
+    analyze = Step(
+        id=analyze_id, task_id=task_id, kind=StepKind.ANALYZE,
+        dependencies=bench_ids, input_artifacts=[],
+    )
+    critique = Step(
+        id=critique_id, task_id=task_id, kind=StepKind.CRITIQUE,
+        dependencies=[*bench_ids, analyze_id, update_id], input_artifacts=[]
+    )
+    return ResearchTask(
+        id=task_id, objective=objective, status=ResearchTaskStatus.PENDING,
+        priority=Priority.MEDIUM, owner="gpu.benchmark", fingerprint_id=uuid4(),
+        steps=[fetch, *bench_steps, analyze, update_graph, critique],
+        artifacts=[], retry_count=0, retry_budget=3, created_at=now, updated_at=now,
+    )
+    
+
 def build_paper_task(url: str) -> ResearchTask:
     """A 3-step task: FetchPaper -> ExtractSummary -> Critique.
 
@@ -116,75 +159,38 @@ def build_paper_task(url: str) -> ResearchTask:
         updated_at=now,
     )
 
+
 def build_benchmark_task(
     model_repo: str = "Qwen/Qwen3-0.6B",
     dtypes: list[str] | None = None,
+    n_replicates: int = 3,
+) -> ResearchTask:
+    """Dtype knob: fp16 vs fp32 arms."""
+    dtypes = dtypes or ["float16", "float32"]
+    arm_params = [
+        {"knob": "dtype", "dtype": dt, "n_tokens": 128, "batch_size": 1}
+        for dt in dtypes
+    ]
+    return _comparison_task(
+        model_repo, arm_params,
+        f"Benchmark {model_repo}: {' vs '.join(dtypes)}", n_replicates)
+
+
+def build_cache_task(
+    model_repo: str = "Qwen/Qwen3-0.6B",
+    dtype: str = "float32",
     n_replicates: int = 3
 ) -> ResearchTask:
-    """Fan-out DAG: FetchWeights -> [RunBenchmark per (dtype, replicate)] -> Analyze (fan-in)
-    One knob varies across the branches (dtype); N replicates per arm so the judge can reason
-    about run-to-tun variance (its own flagged fix: N=1 per config)
-    """
-    if n_replicates < 1:
-        raise ValueError("n_replicates must be >= 1")
-    dtypes = dtypes or ["float16", "float32"]
-    task_id = str(uuid4())
-    fetch_id = str(uuid4())
-    bench_ids = [str(uuid4()) for _ in range(len(dtypes) * n_replicates)]
-    analyze_id = str(uuid4())
-    update_id = str(uuid4())
-    critique_id = str(uuid4())
-    
-    update_graph = Step(
-        id=update_id, task_id=task_id, kind=StepKind.UPDATE_GRAPH,
-        # deps = the RESULT-producing steps: UpdateGraph reads raw runs (the KG
-        # records observations, never aggregates), so it no longer waits on Analyze.
-        dependencies=[*bench_ids], input_artifacts=[],
-        params={"card":"GTX-1650-Ti"}
-    )
-    now = datetime.now(UTC)
-
-    fetch = Step(
-        id=fetch_id, task_id=task_id, kind=StepKind.FETCH_WEIGHTS,
-        dependencies=[], input_artifacts=[], params={"repo_id": model_repo},
-    )
-    bench_steps = [
-        Step(
-            id=bid, task_id=task_id, kind=StepKind.RUN_BENCHMARK,
-            dependencies=[fetch_id], input_artifacts=[],
-            # dtype-major, replicate-minor (float16 x3, then float32 x3). Replicate
-            # index deliberately NOT in params -- params are identical within an arm
-            # so the config stamp groups them in the KG.
-            params={"knob": "dtype", "dtype": dt, "n_tokens": 128, "batch_size": 1},
-        )
-        for bid, dt in zip(
-            bench_ids, [dt for dt in dtypes for _ in range(n_replicates)]
-        )
+    """Cache knob, dtype FROZEN: one cause, one effect. (The dtype x cache
+    grid is a later decision, on evidence.)"""
+    arm_params = [
+        {"knob": "use_cache", "use_cache": uc, "dtype": dtype,
+            "n_tokens": 128, "batch_size": 1}
+        for uc in (False, True)
     ]
-    analyze = Step(
-        id=analyze_id, task_id=task_id, kind=StepKind.ANALYZE,
-        dependencies=bench_ids,
-        input_artifacts=[],
-    )
-    critique = Step(
-        id=critique_id, task_id=task_id, kind=StepKind.CRITIQUE,
-        dependencies=[*bench_ids, analyze_id, update_id],
-        input_artifacts=[]
-    )
-    return ResearchTask(
-        id=task_id,
-        objective=f"Benchmark {model_repo}: {' vs '.join(dtypes)}",
-        status=ResearchTaskStatus.PENDING,
-        priority=Priority.MEDIUM,
-        owner="gpu.benchmark",
-        fingerprint_id=uuid4(),
-        steps=[fetch, *bench_steps, analyze, update_graph, critique],
-        artifacts=[],
-        retry_count=0,
-        retry_budget=3,
-        created_at=now,
-        updated_at=now,
-    )
+    return _comparison_task(
+        model_repo, arm_params,
+        f"Benchmark {model_repo}: cache off vs on ({dtype})", n_replicates)
 
 def main(url: str) -> None:
     registry, bus, artifacts, lessons, knowledge, client = wire()
@@ -273,9 +279,9 @@ def main(url: str) -> None:
         print(f"      tags: {', '.join(lesson.tags)}")
 
 
-def main_benchmark() -> None:
+def main_benchmark(cache: bool = False) -> None:
     registry, bus, artifacts, lessons, knowledge, client = wire()
-    task = build_benchmark_task()
+    task = build_cache_task() if cache else build_benchmark_task()
     registry.create_task(task)
 
     benchmark_worker = BenchmarkWorker(
@@ -336,4 +342,4 @@ if __name__ == "__main__":
     if args.command == "paper":
         main(args.url)
     else:
-        main_benchmark()
+        main_benchmark(cache=args.cache)

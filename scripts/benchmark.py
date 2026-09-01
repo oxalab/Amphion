@@ -15,7 +15,7 @@ import sys
 import time
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 DEFAULT_PROMPT = (
     "Large language model inference performance depends on memory bandwidth, "
@@ -31,6 +31,8 @@ def parse_args():
     _ = p.add_argument("--n_tokens", type=int, default=64)
     _ = p.add_argument("--batch_size", type=int, default=1)
     _ = p.add_argument("--prompt", default=DEFAULT_PROMPT)
+    _ = p.add_argument("--use-cache", default="false", choices=["true", "false"],
+        help="true: decode with a growing KV Cache; false; naive full re-process")
     return p.parse_args()
 
 
@@ -79,19 +81,36 @@ def main() -> int:
             torch.cuda.synchronize()          # ...and wait for the GPU to actually finish
             ttft_ms = (time.perf_counter() - t0) * 1000
 
-            # --- decode: greedy, full re-process each step. This is the BASELINE --
-            # deliberately no KV-cache tricks; the use_cache comparison is a
-            # rung-2 experiment on this same script. ---
+            # --- decode: two arms share the timing discipline: step 0 is
+            # prompt processing (naive: re-process; cached: prefill+cache),
+            # excluded from the rate via step_times[1:] below, ---
             seq = input_ids.input_ids
             step_times = []
-            for _ in range(args.n_tokens):
-                torch.cuda.synchronize()
-                t = time.perf_counter()
-                out = model(seq)
-                next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-                seq = torch.cat([seq, next_tok], dim=-1)
-                torch.cuda.synchronize()
-                step_times.append(time.perf_counter() - t)
+            if args.use_cache == "true":
+                # KV-cached: prefill once, the ONE token per step — the cache
+                # carries all previoud K/V (key & value pairs), so each step is O(1)
+                # instead of naive arm's full O(n) re-process. This is the arm a 
+                # practitioner should ship; the naive arm is what they accidentally ship.
+                cache = DynamicCache()
+                next_tok = None
+                for _ in range(args.n_tokens):
+                    torch.cuda.synchronize()
+                    t = time.perf_counter()
+                    tok_in = seq if next_tok is None else next_tok
+                    out = model(tok_in, past_key_values=cache, use_cache=True)
+                    next_tok = out.logits[:, -1, :].argmax(dim=-1, keedim=True)
+                    seq = torch.cat([seq, next_tok], dim=-1)
+                    torch.cuda.synchronize()
+                    step_times.append(time.perf_counter() - t)
+            else:
+                for _ in range(args.n_tokens):
+                    torch.cuda.synchronize()
+                    t = time.perf_counter()
+                    out = model(seq)
+                    next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                    seq = torch.cat([seq, next_tok], dim=-1)
+                    torch.cuda.synchronize()
+                    step_times.append(time.perf_counter() - t)
     except torch.cuda.OutOfMemoryError as e:
         print(f"OOM during generation: {e}", file=sys.stderr)
         return 1
@@ -106,6 +125,7 @@ def main() -> int:
         "dtype": args.dtype,
         "batch_size": args.batch_size,
         "n_tokens": args.n_tokens,
+        "use_cache": args.use_cache == "true", 
         "gpu": torch.cuda.get_device_name(0),
         "ttft_ms": round(ttft_ms, 2),
         "tokens_per_sec": round(tokens_per_sec, 2),

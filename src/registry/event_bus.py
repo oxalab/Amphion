@@ -121,3 +121,27 @@ class EventBus:
             )
             for row in rows
         ]
+
+    def poll(self, after_rowid: int = 0) -> tuple[int, list[Event]]:
+        """New events since a cursor, for live tailing (the TUI Watch screen).
+
+        Returns (new_cursor, events). The cursor is the implicit rowid —
+        monotonic for this insert-only table, so no extra id column is needed.
+        Callers loop: cursor, batch = poll(cursor); render batch.
+        """
+        rows = self.conn.execute(
+            "SELECT rowid, * FROM events WHERE rowid > ? ORDER BY rowid",
+            (after_rowid,),
+        ).fetchall()
+        cursor = rows[-1]["rowid"] if rows else after_rowid
+        events = [
+            Event(
+                id=row["id"],
+                type=EventType(row["type"]),
+                producer_id=row["producer_id"],
+                payload=json.loads(row["payload"]),
+                created_at=datetime.fromisoformat(row["created_at"]),
+            )
+            for row in rows
+        ]
+        return cursor, events

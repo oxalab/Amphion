@@ -174,3 +174,52 @@ class KnowledgeStore:
             "SELECT id FROM kg_nodes WHERE type = ? AND key = ?", (type, key)
         ).fetchone()
         return row["id"] if row else None
+
+    def browse(self) -> list[dict]:
+        """Every finding, grouped for tree display: metric -> card -> config,
+        leaves = (value, task, source, protocol). Read-only, additive — the
+        TUI Knowledge screen; no graph logic lives in the UI.
+
+        This is find_findings' sibling: that one answers "what do I know in
+        THIS context", this one answers "what do I know at all".
+        """
+        rows = self.conn.execute(
+            """
+            SELECT f.key AS finding_key, m.key AS metric, cd.key AS card,
+                   c.key AS config, p.key AS protocol
+            FROM kg_nodes f
+            JOIN kg_edges e1 ON e1.src_id = f.id AND e1.rel = 'MEASURED'
+            JOIN kg_nodes m  ON m.id = e1.dst_id AND m.type = 'METRIC'
+            JOIN kg_edges e4 ON e4.src_id = f.id AND e4.rel = 'ON_CARD'
+            JOIN kg_nodes cd ON cd.id = e4.dst_id
+            JOIN kg_edges ec ON ec.src_id = f.id AND ec.rel = 'WITH_CONFIG'
+            JOIN kg_nodes c  ON c.id = ec.dst_id
+            LEFT JOIN kg_edges ep ON ep.src_id = f.id AND ep.rel = 'WITH_PROTOCOL'
+            LEFT JOIN kg_nodes p  ON p.id = ep.dst_id
+            WHERE f.type = 'FINDING'
+            ORDER BY m.key, cd.key, c.key
+            """
+        ).fetchall()
+
+        tree: dict[str, dict[str, dict[str, list[dict]]]] = {}
+        for row in rows:
+            payload = json.loads(row["finding_key"])
+            leaf = {
+                "value": payload.get("value"),
+                "task": payload.get("task"),
+                "source": payload.get("source"),
+                "protocol": row["protocol"],
+            }
+            tree.setdefault(row["metric"], {}).setdefault(
+                row["card"], {}).setdefault(row["config"], []).append(leaf)
+        # flatten to ordered dicts of lists — the shape a Textual Tree eats
+        return [
+            {"metric": metric, "cards": [
+                {"card": card, "configs": [
+                    {"config": config, "findings": findings}
+                    for config, findings in sorted(configs.items())
+                ]}
+                for card, configs in sorted(cards.items())
+            ]}
+            for metric, cards in sorted(tree.items())
+        ]
